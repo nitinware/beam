@@ -33,7 +33,7 @@ provideIntegrationTestingDependencies()
 enableJavaPerformanceTesting()
 
 description = "Apache Beam :: SDKs :: Java :: IO :: ClickHouse"
-ext.summary = "IO to write to ClickHouse (https://clickhouse.com)."
+ext.summary = "IO to read from and write to ClickHouse (https://clickhouse.com)."
 
 // Match the output directory for generated code with the package, to be more tool-friendly
 def generatedJavaccSourceDir = "${project.buildDir}/generated/javacc"

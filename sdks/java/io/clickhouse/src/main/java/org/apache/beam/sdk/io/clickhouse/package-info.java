@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 /**
- * Transform for writing to ClickHouse.
+ * Transforms for bounded, schema-aware reads from and writes to ClickHouse.
  *
  * @see org.apache.beam.sdk.io.clickhouse.ClickHouseIO
  */

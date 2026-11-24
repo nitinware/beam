@@ -890,7 +890,7 @@ This table provides a consolidated, at-a-glance overview of the available built-
   </tr>
   <tr>
     <td>ClickHouseIO</td>
-    <td class="absent">✘</td>
+    <td class="present">✔</td>
     <td class="present">✔</td>
     <td class="present">
       ✔

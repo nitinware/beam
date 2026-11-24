@@ -17,6 +17,8 @@
  */
 package org.apache.beam.sdk.io.clickhouse;
 
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
+
 import com.clickhouse.client.api.Client;
 import com.clickhouse.client.api.insert.InsertResponse;
 import com.clickhouse.client.api.query.GenericRecord;
@@ -24,6 +26,7 @@ import com.clickhouse.client.api.query.Records;
 import com.clickhouse.data.ClickHouseFormat;
 import com.google.auto.value.AutoValue;
 import java.io.ByteArrayOutputStream;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -45,11 +48,13 @@ import org.apache.beam.sdk.schemas.transforms.Select;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.util.BackOff;
 import org.apache.beam.sdk.util.BackOffUtils;
 import org.apache.beam.sdk.util.FluentBackoff;
 import org.apache.beam.sdk.util.ReleaseInfo;
 import org.apache.beam.sdk.util.Sleeper;
+import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PDone;
 import org.apache.beam.sdk.values.Row;
@@ -61,7 +66,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * An IO to write to ClickHouse.
+ * An IO for bounded reads from and writes to ClickHouse.
+ *
+ * <p>See {@link #read(String)} for reads producing schema-aware {@link Row}s.
  *
  * <h3>Writing to ClickHouse</h3>
  *
@@ -232,6 +239,360 @@ public class ClickHouseIO {
         .build()
         .withInsertDeduplicate(true)
         .withInsertDistributedSync(true);
+  }
+
+  /**
+   * Creates a bounded read configured with a JDBC URL.
+   *
+   * <p>Call {@link Read#withSchema(Schema)} and exactly one of {@link Read#withQuery(String)} or
+   * {@link Read#withTable(String)}. Additional connection properties can be supplied using {@link
+   * Read#withProperties(Properties)}. This method does not connect to ClickHouse.
+   */
+  public static Read read(String jdbcUrl) {
+    ClickHouseJdbcUrlParser.ParsedJdbcUrl parsed;
+    try {
+      parsed = ClickHouseJdbcUrlParser.parse(jdbcUrl);
+    } catch (IllegalArgumentException e) {
+      // The existing parser includes the URL in some errors. It may contain credentials.
+      String detail =
+          "expected a ClickHouse JDBC URL with a valid HTTP(S) host and parameter encoding";
+      Throwable cause = e.getCause();
+      if (cause instanceof URISyntaxException) {
+        // getReason() describes the syntax violation without including the original URL.
+        detail = ((URISyntaxException) cause).getReason();
+      }
+      throw new IllegalArgumentException("Invalid ClickHouse connection URL: " + detail);
+    }
+    return new AutoValue_ClickHouseIO_Read.Builder()
+        .clickHouseUrl(parsed.getClickHouseUrl())
+        .database(parsed.getDatabase())
+        .connectionProperties(copyReadProperties(parsed.getProperties()))
+        .build();
+  }
+
+  private static Properties copyReadProperties(Properties source) {
+    Properties copy = new Properties();
+    for (String name : source.stringPropertyNames()) {
+      copy.setProperty(name, source.getProperty(name));
+    }
+    return copy;
+  }
+
+  /**
+   * A bounded read producing {@link Row}s with a caller-supplied schema.
+   *
+   * <p>Query mode executes caller-supplied SQL as a single read. Table mode selects the schema's
+   * fields in schema order and partitions the configured inclusive interval. The partition column
+   * need not appear in the output schema. A schema is required in both modes; pipeline construction
+   * does not connect to ClickHouse. Result metadata and values are validated when workers read
+   * them. Table mode also validates the partition column against database metadata on workers.
+   *
+   * <h3>Single-query reads</h3>
+   *
+   * <p>Supply the expected output schema and SQL. Query mode executes the SQL unchanged and does
+   * not split it into parallel queries. Result columns bind by exact name, rather than position;
+   * extra result columns are ignored.
+   *
+   * <pre>{@code
+   * Schema eventSchema = Schema.builder()
+   *     .addInt64Field("id")
+   *     .addStringField("event_type")
+   *     .build();
+   * Properties properties = new Properties();
+   * properties.setProperty("user", "beam_reader");
+   *
+   * PCollection<Row> events = pipeline.apply(
+   *     ClickHouseIO.read("jdbc:clickhouse://localhost:8123/default")
+   *         .withProperties(properties)
+   *         .withQuery("SELECT id, event_type FROM events WHERE id >= 0 AND id <= 100")
+   *         .withSchema(eventSchema));
+   * }</pre>
+   *
+   * <h3>Partitioned table reads</h3>
+   *
+   * <p>The schema selects the retrieved columns and their expected types, without SQL casts. Table
+   * and column names are quoted as identifiers, not interpreted as SQL expressions. For example,
+   * the following reads only {@code event_type}, using {@code id} to partition the inclusive
+   * interval {@code [0, 100]}:
+   *
+   * <pre>{@code
+   * Schema projectedSchema = Schema.builder().addStringField("event_type").build();
+   * PCollection<Row> events = pipeline.apply(
+   *     ClickHouseIO.read("jdbc:clickhouse://localhost:8123/default")
+   *         .withProperties(properties)
+   *         .withTable("events")
+   *         .withSchema(projectedSchema)
+   *         .withPartitionColumn("id")
+   *         .withLowerBound(0L)
+   *         .withUpperBound(100L)
+   *         .withNumPartitions(4));
+   * }</pre>
+   *
+   * <p>Only non-nullable ClickHouse {@code Int32} and {@code Int64} partition columns are
+   * supported. Both bounds restrict the rows read, even with one partition. Equal bounds select one
+   * key. Rows outside the bounds are excluded; callers reading a whole table must choose bounds
+   * covering the intended data. The final partition includes the upper bound; intermediate upper
+   * bounds are exclusive. For the example above the predicates are {@code id >= 0 AND id < 25},
+   * {@code id >= 25 AND id < 50}, {@code id >= 50 AND id < 75}, and {@code id >= 75 AND id <= 100}.
+   *
+   * <p>Partition count must be positive and is capped at the interval's integer cardinality. As a
+   * v1 implementation restriction, inclusive cardinality must fit in a signed Java {@code long}.
+   * The effective partition count is limited to 10,000 because descriptors are materialized in the
+   * pipeline graph. Automatic bounds discovery and dynamic splitting are not supported. Partitions
+   * use equal-width key ranges, which may contain uneven numbers of rows. Concurrent execution
+   * depends on the runner, and database scan efficiency depends on the table's sorting key and
+   * query planning.
+   *
+   * <h3>Supported output types</h3>
+   *
+   * <table>
+   * <caption>ClickHouse read type mappings</caption>
+   * <tr><th scope="col">ClickHouse type</th><th scope="col">Beam field type</th></tr>
+   * <tr><td>Int8</td><td>BYTE</td></tr>
+   * <tr><td>Int16, UInt8</td><td>INT16</td></tr>
+   * <tr><td>Int32, UInt16</td><td>INT32</td></tr>
+   * <tr><td>Int64, UInt32</td><td>INT64</td></tr>
+   * <tr><td>Float32</td><td>FLOAT</td></tr>
+   * <tr><td>Float64</td><td>DOUBLE</td></tr>
+   * <tr><td>String</td><td>STRING</td></tr>
+   * <tr><td>Bool</td><td>BOOLEAN</td></tr>
+   * <tr><td>Date</td><td>DATETIME: calendar date at midnight UTC</td></tr>
+   * <tr><td>DateTime</td><td>DATETIME: the corresponding instant, at second precision</td></tr>
+   * </table>
+   *
+   * <p>Nullable source columns require nullable Beam fields; non-nullable sources may bind to
+   * either nullable or non-nullable fields. Missing columns, incompatible types, unexpected nulls,
+   * and unsupported selected types fail the read, including metadata validation for empty results.
+   * There is no implicit numeric widening. FixedString, UInt64, Decimal, DateTime64, complex types,
+   * DateTime32, and LowCardinality or aggregate wrappers are unsupported. FixedString is deferred
+   * because the client decoder does not preserve arbitrary bytes. Read type support is narrower
+   * than write type support.
+   *
+   * <h3>Consistency and connection settings</h3>
+   *
+   * <p>On a stable dataset, partitions cover the configured interval without gaps or overlaps and
+   * preserve duplicate rows. Independently executed partition queries do not share a globally
+   * consistent snapshot. Concurrent inserts, deletes, or partition-key changes may cause omissions
+   * or duplicate observations. Output order is unspecified.
+   *
+   * <p>Directly supplied credentials may be serialized into the pipeline graph. Display data omits
+   * raw SQL and connection properties. Worker failures preserve original client/server causes,
+   * which may contain SQL or configuration values; avoid embedding secrets in SQL literals and
+   * restrict access to pipeline graphs and error logs. URL parsing and property-conflict errors
+   * omit supplied values.
+   *
+   * <p>The connector does not restart queries internally. Client request retries, if configured,
+   * occur before a query response is returned. Failures after row emission propagate to Beam's
+   * bundle retry mechanism; mutable data may yield different results when a query is re-executed.
+   */
+  @AutoValue
+  public abstract static class Read extends PTransform<PBegin, PCollection<Row>> {
+    abstract String clickHouseUrl();
+
+    abstract String database();
+
+    abstract Properties connectionProperties();
+
+    abstract @Nullable String query();
+
+    abstract @Nullable String table();
+
+    abstract @Nullable Schema schema();
+
+    abstract @Nullable String partitionColumn();
+
+    abstract @Nullable Long lowerBound();
+
+    abstract @Nullable Long upperBound();
+
+    abstract @Nullable Integer numPartitions();
+
+    abstract Builder toBuilder();
+
+    /**
+     * Adds connection properties, retaining a defensive copy including inherited string properties.
+     * Conflicting values for an existing key (including a URL property) are rejected, following the
+     * write API's convention. Repeating the same value is allowed. Error messages omit values.
+     */
+    public Read withProperties(Properties properties) {
+      checkArgument(properties != null, "Connection properties must not be null");
+      Properties merged = copyReadProperties(connectionProperties());
+      for (String key : properties.stringPropertyNames()) {
+        String existing = merged.getProperty(key);
+        String supplied = properties.getProperty(key);
+        checkArgument(
+            existing == null || existing.equals(supplied),
+            "Connection property conflict for key '%s'; use one consistent value",
+            key);
+        merged.setProperty(key, supplied);
+      }
+      return toBuilder().connectionProperties(merged).build();
+    }
+
+    /** Returns a defensive copy of the configured connection properties. */
+    public final Properties properties() {
+      return copyReadProperties(connectionProperties());
+    }
+
+    /** Sets caller-supplied SQL for a single read. Mutually exclusive with table mode. */
+    public Read withQuery(String query) {
+      return toBuilder().query(query).build();
+    }
+
+    /**
+     * Sets an unqualified table name; the database comes from the connection URL. All partition
+     * options must be supplied together in table mode.
+     */
+    public Read withTable(String table) {
+      return toBuilder().table(table).build();
+    }
+
+    /**
+     * Sets the required output schema. In table mode, its fields also select the columns to
+     * retrieve in schema order. Types describe expected values rather than requesting SQL casts.
+     * FixedString is unsupported for reads in v1 because the client decoder does not preserve
+     * arbitrary bytes.
+     */
+    public Read withSchema(Schema schema) {
+      return toBuilder().schema(schema).build();
+    }
+
+    /** Sets a non-nullable Int32 or Int64 partition column, independently of the output schema. */
+    public Read withPartitionColumn(String column) {
+      return toBuilder().partitionColumn(column).build();
+    }
+
+    /**
+     * Sets the inclusive lower read bound; valid only in table mode. Equal bounds select one key.
+     * Inclusive range cardinality must fit in a signed long in v1.
+     */
+    public Read withLowerBound(long lowerBound) {
+      return toBuilder().lowerBound(lowerBound).build();
+    }
+
+    /** Sets the inclusive upper read bound, including when only one partition is requested. */
+    public Read withUpperBound(long upperBound) {
+      return toBuilder().upperBound(upperBound).build();
+    }
+
+    /**
+     * Sets a positive requested partition count, capped at the inclusive range cardinality. Actual
+     * concurrent execution depends on the runner; equal-width ranges need not have equal row
+     * counts.
+     */
+    public Read withNumPartitions(int numPartitions) {
+      return toBuilder().numPartitions(numPartitions).build();
+    }
+
+    /** Validates locally available settings without contacting ClickHouse. */
+    void validateConfiguration() {
+      checkArgument(schema() != null, "A caller-supplied Beam schema is required");
+      checkArgument(
+          schema().getFieldCount() > 0, "The output schema must contain at least one field");
+      ClickHouseRowReader.validateSchema(schema());
+      for (Schema.Field field : schema().getFields()) {
+        requireReadName(field.getName(), "Output field name");
+      }
+      checkArgument(
+          (query() != null) != (table() != null),
+          "Exactly one of withQuery() or withTable() must be specified");
+      boolean hasPartitionOptions =
+          partitionColumn() != null
+              || lowerBound() != null
+              || upperBound() != null
+              || numPartitions() != null;
+      if (query() != null) {
+        checkArgument(!query().trim().isEmpty(), "Read query must not be blank");
+        checkArgument(!hasPartitionOptions, "Partition options are valid only with withTable()");
+        return;
+      }
+      requireReadName(table(), "Table name");
+      checkArgument(
+          partitionColumn() != null
+              && lowerBound() != null
+              && upperBound() != null
+              && numPartitions() != null,
+          "Table reads require a partition column, lower bound, upper bound, and partition count");
+      requireReadName(partitionColumn(), "Partition column name");
+      checkArgument(
+          lowerBound() <= upperBound(), "Lower bound must be less than or equal to upper bound");
+      checkArgument(numPartitions() >= 1, "Partition count must be at least 1");
+      ClickHouseRangePartitioner.effectivePartitionCount(
+          inclusiveRangeCardinality(), numPartitions());
+    }
+
+    // Called only after table-mode configuration has been validated. Never compute upperBound + 1.
+    long inclusiveRangeCardinality() {
+      return ClickHouseRangePartitioner.inclusiveCardinality(lowerBound(), upperBound());
+    }
+
+    private static void requireReadName(@Nullable String name, String description) {
+      checkArgument(name != null && !name.trim().isEmpty(), "%s must not be blank", description);
+      checkArgument(name.indexOf('\0') < 0, "%s must not contain a NUL character", description);
+    }
+
+    @Override
+    public PCollection<Row> expand(PBegin input) {
+      validateConfiguration();
+      return input
+          .apply("PlanRead", new ClickHouseReadPartitions(this))
+          .apply("ReadClickHouse", ParDo.of(new ClickHouseReadFn(this)))
+          .setRowSchema(schema());
+    }
+
+    @Override
+    public void populateDisplayData(DisplayData.Builder builder) {
+      super.populateDisplayData(builder);
+      builder.add(DisplayData.item("url", clickHouseUrl()));
+      builder.add(DisplayData.item("database", database()));
+      builder.add(DisplayData.item("readMode", query() != null ? "query" : "table"));
+      // Raw SQL and connection properties may contain secrets; omit both from display data.
+      if (table() != null) {
+        builder.add(DisplayData.item("table", table()));
+      }
+      if (partitionColumn() != null) {
+        builder.add(DisplayData.item("partitionColumn", partitionColumn()));
+      }
+      if (lowerBound() != null) {
+        builder.add(DisplayData.item("lowerBound", lowerBound()));
+      }
+      if (upperBound() != null) {
+        builder.add(DisplayData.item("upperBound", upperBound()));
+      }
+      if (numPartitions() != null) {
+        builder.add(DisplayData.item("numPartitions", numPartitions().longValue()));
+      }
+    }
+
+    @Override
+    public final String toString() {
+      return "ClickHouseIO.Read";
+    }
+
+    @AutoValue.Builder
+    abstract static class Builder {
+      abstract Builder clickHouseUrl(String url);
+
+      abstract Builder database(String database);
+
+      abstract Builder connectionProperties(Properties properties);
+
+      abstract Builder query(String query);
+
+      abstract Builder table(String table);
+
+      abstract Builder schema(Schema schema);
+
+      abstract Builder partitionColumn(String column);
+
+      abstract Builder lowerBound(Long lowerBound);
+
+      abstract Builder upperBound(Long upperBound);
+
+      abstract Builder numPartitions(Integer numPartitions);
+
+      abstract Read build();
+    }
   }
 
   /** A {@link PTransform} to write to ClickHouse. */
