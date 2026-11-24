@@ -19,7 +19,6 @@ package org.apache.beam.sdk.io.clickhouse;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -250,7 +249,6 @@ public class ClickHouseReadFailureTest {
       IOException error = assertThrows(IOException.class, fn::setup);
       assertFalse(error.toString().contains("private_password"));
       assertTrue(error.getCause() instanceof NumberFormatException);
-      assertNotNull(error.getCause());
     } finally {
       fn.tearDown();
     }

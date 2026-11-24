@@ -155,8 +155,7 @@ public class ClickHouseReadTest {
   @Test
   public void displayDataContainsSafeReadSettingsButNotCredentialsOrSql() {
     ClickHouseIO.Read read = tableRead().withProperties(secretProperties());
-    org.apache.beam.sdk.transforms.display.DisplayData data =
-        org.apache.beam.sdk.transforms.display.DisplayData.from(read);
+    DisplayData data = DisplayData.from(read);
     Map<String, Object> values = new HashMap<>();
     data.items().forEach(item -> values.put(item.getKey(), item.getValue()));
     assertEquals("http://unreachable.invalid:8123", values.get("url"));
@@ -168,7 +167,7 @@ public class ClickHouseReadTest {
     assertFalse(data.toString().contains("private-password"));
     assertFalse(data.toString().contains("password"));
     String queryData =
-        org.apache.beam.sdk.transforms.display.DisplayData.from(
+        DisplayData.from(
                 ClickHouseIO.read(URL)
                     .withQuery("SELECT 'private-password'")
                     .withProperties(secretProperties())
